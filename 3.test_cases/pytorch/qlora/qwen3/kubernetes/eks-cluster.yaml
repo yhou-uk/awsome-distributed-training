@@ -1,0 +1,134 @@
+# Amazon EKS Cluster Configuration for QLoRA Training
+# ====================================================
+# This file defines the complete infrastructure for running
+# QLoRA fine-tuning on Amazon EKS with GPU support.
+#
+# Usage:
+#   eksctl create cluster -f kubernetes/eks-cluster.yaml
+#
+# Prerequisites:
+#   - AWS CLI configured with appropriate permissions
+#   - eksctl installed (https://eksctl.io/installation/)
+#   - kubectl installed
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: qwen3-qlora-cluster      # Cluster name (customize as needed)
+  region: us-east-1               # AWS region
+  version: "1.29"                 # Kubernetes version
+
+# IAM Configuration
+# -----------------
+# OIDC is required for IAM roles for service accounts (IRSA)
+iam:
+  withOIDC: true
+
+# VPC Configuration
+# -----------------
+# eksctl will create a new VPC with the specified CIDR
+vpc:
+  cidr: "10.0.0.0/16"
+  nat:
+    gateway: Single               # Single NAT gateway (cost-effective)
+  clusterEndpoints:
+    publicAccess: true            # Allow kubectl access from internet
+    privateAccess: true           # Allow internal cluster communication
+
+# Node Groups
+# -----------
+# We define two node groups:
+# 1. System nodes for Kubernetes system pods
+# 2. GPU nodes for training workloads
+managedNodeGroups:
+  # System Node Group
+  # -----------------
+  # Runs Kubernetes system components and non-GPU workloads
+  - name: system-nodes
+    instanceType: m5.large        # 2 vCPU, 8 GB RAM
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 2
+    volumeSize: 50                # GB
+    volumeType: gp3
+    labels:
+      node-type: system
+    tags:
+      Project: qwen3-qlora-tutorial
+      Environment: training
+
+  # GPU Node Group
+  # --------------
+  # Runs the actual training workloads with multi-GPU support.
+  # g5.12xlarge: 4x NVIDIA A10G (24GB VRAM each = 96GB total), 48 vCPU, 192 GB RAM
+  # Enables Data Parallelism (DDP) + DeepSpeed ZeRO for memory-efficient training.
+  # Alternative: g5.4xlarge (1x A10G, 16 vCPU, 64GB RAM) for single-GPU runs.
+  - name: gpu-nodes
+    instanceType: g5.12xlarge     # 4x NVIDIA A10G GPUs
+    desiredCapacity: 1            # Start with 1 multi-GPU node
+    minSize: 0                    # Can scale to 0 when not training
+    maxSize: 1                    # Maximum 1 multi-GPU node
+    volumeSize: 200               # GB - larger for model/data caching
+    volumeType: gp3
+    availabilityZones: ["us-east-1f"]  # AZ with g5 capacity (must match VPC subnets)
+
+    # Labels for node selection
+    labels:
+      node-type: gpu
+      nvidia.com/gpu: "true"
+
+    # Taints to ensure only GPU workloads run here
+    # This prevents system pods from consuming GPU resources
+    taints:
+      - key: nvidia.com/gpu
+        value: "true"
+        effect: NoSchedule
+
+    tags:
+      Project: qwen3-qlora-tutorial
+      Environment: training
+      k8s.io/cluster-autoscaler/enabled: "true"
+
+    # SSH access (disabled by default)
+    # To enable, generate an SSH key first:
+    #   ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa
+    # Then uncomment the lines below:
+    # ssh:
+    #   allow: true
+    #   publicKeyPath: ~/.ssh/id_rsa.pub
+
+# Add-ons
+# -------
+# Essential add-ons for the cluster
+addons:
+  # VPC CNI for pod networking
+  - name: vpc-cni
+    version: latest
+
+  # CoreDNS for cluster DNS
+  - name: coredns
+    version: latest
+
+  # kube-proxy for service networking
+  - name: kube-proxy
+    version: latest
+
+  # EBS CSI Driver for persistent volumes
+  # Required for training checkpoints and model storage
+  - name: aws-ebs-csi-driver
+    version: latest
+    attachPolicyARNs:
+      - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+# CloudWatch Configuration (optional)
+# ------------------------------------
+# Enable CloudWatch logging for debugging
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator
+      - controllerManager
+      - scheduler

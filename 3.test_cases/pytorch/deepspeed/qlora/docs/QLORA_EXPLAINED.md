@@ -200,7 +200,7 @@ model parameters, but optimizer memory is divided by the number of GPUs:
 
 Key settings that prevent OOM:
 - `max_seq_length: 1536` (reduced from 2048, saves ~25% activation memory)
-- `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True`
+- `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128`
 - `gradient_checkpointing: true` (trades compute for memory)
 
 ## Code Example
@@ -270,7 +270,7 @@ model = model.merge_and_unload()  # Permanently merges adapter into weights
 # Requires ~16GB VRAM for inference
 ```
 
-See `notebooks/inference_demo.ipynb` for a complete working example.
+See `src/inference_demo.py` for a complete working example.
 
 ## Quality vs. Efficiency Trade-offs
 
@@ -317,5 +317,5 @@ max_seq_length = 1024
 - [QLoRA Paper](https://arxiv.org/abs/2305.14314) - Original research
 - [LoRA Paper](https://arxiv.org/abs/2106.09685) - Foundation technique
 - [PEFT Documentation](https://huggingface.co/docs/peft) - Implementation details
-- [BitsAndBytes](https://github.com/TimDettmers/bitsandbytes) - Quantization library
+- [BitsAndBytes](https://github.com/bitsandbytes-foundation/bitsandbytes) - Quantization library
 - [DeepSpeed](https://www.deepspeed.ai/tutorials/zero/) - ZeRO optimization stages

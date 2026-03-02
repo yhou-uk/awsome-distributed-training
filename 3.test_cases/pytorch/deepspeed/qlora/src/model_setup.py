@@ -78,6 +78,12 @@ def get_quantization_config(
         ... )
     """
     # Convert string dtype to torch dtype
+    _valid_dtypes = {"float16", "bfloat16", "float32"}
+    if bnb_4bit_compute_dtype not in _valid_dtypes:
+        raise ValueError(
+            f"Invalid compute dtype '{bnb_4bit_compute_dtype}'. "
+            f"Must be one of: {', '.join(sorted(_valid_dtypes))}"
+        )
     compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
     logger.info(f"Creating quantization config:")
@@ -152,14 +158,20 @@ def get_lora_config(
     )
 
 
-def _get_device_map():
+def _get_device_map(strategy: str = "deepspeed_zero2"):
     """
     Determine the appropriate device_map for model loading.
 
-    For DDP / DeepSpeed: each process loads the full model on its local GPU.
-    Using device_map="auto" with DDP would incorrectly spread the model
-    across all GPUs within a single process, conflicting with DDP's
-    expectation that each rank holds a full model replica.
+    For DDP / DeepSpeed ZeRO-2: each process loads the full model on its
+    local GPU. Using device_map="auto" with DDP would incorrectly spread
+    the model across all GPUs within a single process.
+
+    For DeepSpeed ZeRO-3: device_map must be None because ZeRO-3 shards
+    model parameters across ranks. The Trainer's DeepSpeed integration
+    handles placement automatically.
+
+    Args:
+        strategy: Parallelism strategy (e.g., "deepspeed_zero2", "deepspeed_zero3")
 
     Returns:
         Device map specification for from_pretrained()
@@ -168,9 +180,14 @@ def _get_device_map():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     if world_size > 1:
-        # DDP / DeepSpeed: pin model to this rank's GPU
-        device_map = {"": local_rank}
-        logger.info(f"Multi-GPU DDP mode: loading model on GPU {local_rank}")
+        if "zero3" in strategy.lower():
+            # ZeRO-3 shards parameters across ranks — device_map must be None
+            device_map = None
+            logger.info("Multi-GPU ZeRO-3 mode: device_map=None (Trainer manages placement)")
+        else:
+            # ZeRO-2 / DDP: pin model to this rank's GPU
+            device_map = {"": local_rank}
+            logger.info(f"Multi-GPU DDP mode: loading model on GPU {local_rank}")
     else:
         # Single-GPU: auto placement
         device_map = "auto"
@@ -184,6 +201,7 @@ def load_model_and_tokenizer(
     quantization_config: BitsAndBytesConfig = None,
     max_seq_length: int = 2048,
     trust_remote_code: bool = True,
+    strategy: str = "deepspeed_zero2",
 ):
     """
     Load the base model and tokenizer from Hugging Face.
@@ -219,7 +237,7 @@ def load_model_and_tokenizer(
     logger.info(f"Loading model: {model_name}")
     logger.info("This may take several minutes for large models...")
 
-    device_map = _get_device_map()
+    device_map = _get_device_map(strategy=strategy)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -287,7 +305,7 @@ def setup_model_and_tokenizer(config):
 
     Example:
         >>> from config import FullConfig
-        >>> config = FullConfig.from_yaml("configs/training_config.yaml")
+        >>> config = FullConfig.from_yaml("configs/training_config_zero2.yaml")
         >>> model, tokenizer = setup_model_and_tokenizer(config)
     """
     logger.info("="*60)
@@ -308,6 +326,7 @@ def setup_model_and_tokenizer(config):
         quantization_config=quant_config,
         max_seq_length=config.model.max_seq_length,
         trust_remote_code=config.model.trust_remote_code,
+        strategy=config.parallel.strategy,
     )
 
     # Step 3: Create LoRA config

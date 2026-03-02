@@ -4,7 +4,7 @@ This guide covers common issues and solutions when running the QLoRA fine-tuning
 
 ## Table of Contents
 
-1. [EKS Cluster Issues](#eks-cluster-issues)
+1. [HyperPod EKS Cluster Issues](#hyperpod-eks-cluster-issues)
 2. [GPU and CUDA Issues](#gpu-and-cuda-issues)
 3. [DeepSpeed and Multi-GPU Issues](#deepspeed-and-multi-gpu-issues)
 4. [Training Issues](#training-issues)
@@ -14,35 +14,7 @@ This guide covers common issues and solutions when running the QLoRA fine-tuning
 
 ---
 
-## EKS Cluster Issues
-
-### Cluster Creation Fails
-
-**Symptom**: `eksctl create cluster` fails with errors
-
-**Solutions**:
-
-1. Check IAM permissions:
-   ```bash
-   aws sts get-caller-identity
-   ```
-
-2. Check CloudFormation for details:
-   ```bash
-   aws cloudformation describe-stack-events \
-       --stack-name eksctl-qwen3-qlora-cluster-cluster \
-       --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`]'
-   ```
-
-3. Try a different availability zone. The g5.12xlarge instance may not be
-   available in all AZs. Check capacity:
-   ```bash
-   aws ec2 describe-instance-type-offerings \
-       --location-type availability-zone \
-       --filters Name=instance-type,Values=g5.12xlarge \
-       --region us-east-1 \
-       --query 'InstanceTypeOfferings[].Location'
-   ```
+## HyperPod EKS Cluster Issues
 
 ### Cannot Connect to Cluster
 
@@ -50,9 +22,9 @@ This guide covers common issues and solutions when running the QLoRA fine-tuning
 
 **Solutions**:
 
-1. Update kubeconfig:
+1. Update kubeconfig for HyperPod EKS:
    ```bash
-   aws eks update-kubeconfig --region us-east-1 --name qwen3-qlora-cluster
+   aws eks update-kubeconfig --region $AWS_REGION --name <cluster-name>
    ```
 
 2. Check context:
@@ -63,28 +35,28 @@ This guide covers common issues and solutions when running the QLoRA fine-tuning
 
 3. Verify cluster is active:
    ```bash
-   aws eks describe-cluster --name qwen3-qlora-cluster --query 'cluster.status'
+   aws eks describe-cluster --name <cluster-name> --query 'cluster.status'
    ```
 
 ### GPU Nodes Not Available
 
-**Symptom**: GPU nodes show 0 or pending
+**Symptom**: GPU nodes show 0 or not ready
 
 **Solutions**:
 
-1. Check node group status:
+1. Check node status and labels:
    ```bash
-   eksctl get nodegroup --cluster qwen3-qlora-cluster
+   kubectl get nodes -l node.kubernetes.io/instance-type=ml.g5.12xlarge
+   kubectl get nodes -o wide
    ```
 
-2. Scale up GPU nodes:
+2. Check HyperPod node health:
    ```bash
-   eksctl scale nodegroup --cluster qwen3-qlora-cluster \
-       --name gpu-nodes --nodes 1 --region us-east-1
+   kubectl get nodes -l sagemaker.amazonaws.com/node-health-status=Schedulable
    ```
 
-3. Check for capacity issues in AWS Console (EC2 > Auto Scaling Groups).
-   g5.12xlarge may have limited availability in some AZs.
+3. If no GPU nodes are visible, check the HyperPod cluster instance groups
+   in the SageMaker console or via `aws sagemaker describe-cluster`.
 
 ---
 
@@ -108,7 +80,7 @@ This guide covers common issues and solutions when running the QLoRA fine-tuning
 
 3. Reinstall PyTorch with CUDA:
    ```bash
-   pip install torch --index-url https://download.pytorch.org/whl/cu124
+   pip install 'torch==2.6.0' --index-url https://download.pytorch.org/whl/cu126
    ```
 
 ### CUDA Out of Memory (Single GPU)
@@ -123,7 +95,7 @@ during checkpoint saves.
 
 1. **Switch to multi-GPU with DeepSpeed ZeRO-2** (recommended):
    ```yaml
-   # In configs/training_config.yaml
+   # In configs/training_config_zero2.yaml
    parallel:
      strategy: "deepspeed_zero2"
    ```
@@ -144,7 +116,7 @@ during checkpoint saves.
 
 4. Enable memory-friendly CUDA allocator:
    ```bash
-   export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+   export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
    ```
 
 5. Enable gradient checkpointing (enabled by default):
@@ -171,29 +143,32 @@ full model parameters and activations. If you still OOM:
 
 3. Check for memory fragmentation:
    ```bash
-   export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+   export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
    ```
 
 ### NVIDIA Device Plugin Not Working
 
 **Symptom**: Pods stuck in `Pending` with GPU requests
 
+On HyperPod EKS, the NVIDIA device plugin is managed by the HyperPod Helm chart.
+
 **Solutions**:
 
-1. Reinstall device plugin:
+1. Check device plugin pods:
    ```bash
-   kubectl delete daemonset nvidia-device-plugin-daemonset -n kube-system
-   kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.14.5/nvidia-device-plugin.yml
+   kubectl get pods -n kube-system -l app=nvidia-device-plugin-ds
+   kubectl logs -n kube-system -l app=nvidia-device-plugin-ds
    ```
 
-2. Check device plugin logs:
+2. Verify GPU resources are advertised:
    ```bash
-   kubectl logs -n kube-system -l name=nvidia-device-plugin-ds
+   kubectl describe node <gpu-node-name> | grep -A5 "Allocatable"
+   # Should show nvidia.com/gpu: 4 (or similar)
    ```
 
-3. Verify GPU node labels:
+3. If device plugin pods are missing, verify the HyperPod Helm chart is installed:
    ```bash
-   kubectl get nodes -l nvidia.com/gpu=true
+   helm list -A | grep -i hyperpod
    ```
 
 ---
@@ -209,9 +184,9 @@ training hangs during the first all-reduce operation.
 
 1. Check NCCL debug output:
    ```bash
-   # Set in kubernetes/training-job.yaml env vars:
+   # Set in kubernetes/qwen3_8b-qlora-zero2.yaml env vars:
    NCCL_DEBUG=INFO
-   NCCL_SOCKET_IFNAME=eth0
+   NCCL_SOCKET_IFNAME=^lo
    ```
 
 2. Verify all GPUs are visible within the pod:
@@ -222,17 +197,17 @@ training hangs during the first all-reduce operation.
 
 3. Increase shared memory. NCCL uses `/dev/shm` for inter-GPU communication:
    ```yaml
-   # In training-job.yaml (already configured):
+   # In qwen3_8b-qlora-zero2.yaml (already configured):
    volumes:
      - name: shm
        emptyDir:
          medium: Memory
-         sizeLimit: "32Gi"
+         sizeLimit: "64Gi"
    ```
 
 ### DeepSpeed Checkpoint Incompatibility
 
-**Symptom**: `ValueError: Can't find a valid checkpoint at /workspace/outputs/checkpoint-XXX`
+**Symptom**: `ValueError: Can't find a valid checkpoint at /fsx/qwen3-qlora/outputs/checkpoint-XXX`
 
 This happens when trying to resume a DeepSpeed checkpoint from a non-DeepSpeed
 run, or vice versa. DeepSpeed checkpoints contain `global_step*` directories;
@@ -245,14 +220,14 @@ vanilla HF Trainer checkpoints do not.
 
 2. To manually check checkpoint format:
    ```bash
-   ls /workspace/outputs/checkpoint-*/
+   ls /fsx/qwen3-qlora/outputs/checkpoint-*/
    # DeepSpeed: contains global_step*/ directories
    # Vanilla HF: contains pytorch_model.bin or model.safetensors
    ```
 
 3. To force a fresh start, delete old checkpoints:
    ```bash
-   kubectl exec -it <pod-name> -n ml-training -- rm -rf /workspace/outputs/checkpoint-*
+   kubectl exec -it <pod-name> -n ml-training -- rm -rf /fsx/qwen3-qlora/outputs/checkpoint-*
    ```
 
 ### torchrun Errors
@@ -261,14 +236,9 @@ vanilla HF Trainer checkpoints do not.
 
 **Solutions**:
 
-1. Verify `--nproc_per_node` matches the number of GPUs:
-   ```yaml
-   command:
-     - torchrun
-     - "--nproc_per_node=4"  # Must match nvidia.com/gpu resource request
-     - "--master_port=29500"
-     - "/app/src/train.py"
-   ```
+1. Verify `--nproc_per_node` matches the number of GPUs. The PyTorchJob
+   manifests use `nprocPerNode` which the Training Operator passes to
+   `torchrun` automatically via the `PET_NPROC_PER_NODE` environment variable.
 
 2. Check that `CUDA_VISIBLE_DEVICES` is NOT set. torchrun manages GPU
    assignment via `LOCAL_RANK`.
@@ -320,17 +290,17 @@ vanilla HF Trainer checkpoints do not.
    `--resume_from_checkpoint=auto` which finds the latest valid checkpoint:
    ```bash
    # Check if checkpoints exist
-   kubectl exec -it <pod-name> -n ml-training -- ls /workspace/outputs/
+   kubectl exec -it <pod-name> -n ml-training -- ls /fsx/qwen3-qlora/outputs/
    ```
 
 3. For EKS pods, check shared memory is large enough:
    ```yaml
-   # In kubernetes/training-job.yaml (already configured at 32Gi):
+   # In kubernetes/qwen3_8b-qlora-zero2.yaml (already configured):
    volumes:
      - name: shm
        emptyDir:
          medium: Memory
-         sizeLimit: "32Gi"
+         sizeLimit: "64Gi"
    ```
 
 ### Slow Training
@@ -386,7 +356,7 @@ vanilla HF Trainer checkpoints do not.
 
 3. Build with verbose output:
    ```bash
-   docker build --progress=plain -t qwen3-qlora-training:test -f docker/Dockerfile .
+   docker build --progress=plain -t qwen3-qlora-training:test .
    ```
 
 ### ECR Push Fails
@@ -419,7 +389,7 @@ vanilla HF Trainer checkpoints do not.
 
 **Solution**: Upgrade transformers:
 ```bash
-pip install transformers>=4.51.0
+pip install 'transformers>=4.51.0'
 ```
 
 ### Model Download Fails
@@ -453,19 +423,23 @@ pip install transformers>=4.51.0
 1. Reinstall with CUDA:
    ```bash
    pip uninstall bitsandbytes
-   pip install bitsandbytes>=0.42.0
+   pip install 'bitsandbytes>=0.42.0'
    ```
 
 2. Check CUDA compatibility:
    ```python
    import bitsandbytes as bnb
-   print(bnb.cuda_available)
+   print(bnb.__version__)
+   # Verify 4-bit quantization works
+   import torch
+   x = torch.randn(64, 64, dtype=torch.float16, device="cuda")
+   print("bitsandbytes CUDA OK")
    ```
 
-3. For specific CUDA versions:
+3. Verify bitsandbytes CUDA detection:
    ```bash
-   # For CUDA 11.8
-   pip install bitsandbytes --prefer-binary --extra-index-url=https://pypi.nvidia.com
+   python -c "import bitsandbytes; print(bitsandbytes.__version__)"
+   # bitsandbytes >= 0.42.0 ships pre-compiled CUDA wheels on PyPI
    ```
 
 ---
@@ -478,7 +452,7 @@ pip install transformers>=4.51.0
 
 The merged full-precision model requires ~16GB VRAM. If your GPU has less:
 
-1. Use the 4-bit quantized loading (Section 11 in the inference notebook)
+1. Use 4-bit quantized loading (see `src/inference_demo.py` for an example)
 2. Use CPU offloading:
    ```python
    model = AutoModelForCausalLM.from_pretrained(
@@ -503,8 +477,96 @@ The merged full-precision model requires ~16GB VRAM. If your GPU has less:
 2. If using the EKS-trained model, copy it from the PVC first:
    ```bash
    # Create a temp pod attached to the PVC, then:
-   kubectl cp ml-training/<pod-name>:/workspace/outputs/final_model ./outputs/final_model
+   kubectl cp ml-training/<pod-name>:/fsx/qwen3-qlora/outputs/final_model ./outputs/final_model
    ```
+
+---
+
+## SageMaker HyperPod (Slurm) Issues
+
+### CUBLAS_STATUS_INVALID_VALUE
+
+**Symptom**: Training crashes on the first forward pass with:
+```
+RuntimeError: CUDA error: CUBLAS_STATUS_INVALID_VALUE when calling cublasGemmEx
+```
+
+**Background**: This error originates from PyTorch's cuBLAS linear algebra
+calls, **not** from bitsandbytes — bitsandbytes does not call `cublasGemmEx`
+in its 4-bit quantization kernels. There is no systemic incompatibility
+between any particular CUDA toolkit version and bitsandbytes; `torch+cu128`
+with bitsandbytes 4-bit quantization has been tested successfully on HyperPod
+Slurm (torch 2.9.1+cu128, bitsandbytes 0.49.2, 4x A10G, DeepSpeed ZeRO-2).
+
+The most common cause is **conflicting CUDA toolkit versions** on the host —
+for example, a system-installed CUDA 12.1 `libcublas.so` being loaded instead
+of the one bundled with PyTorch's cu128 wheel.
+
+**Diagnosis**: Check your environment for library conflicts:
+
+```bash
+# Check driver version (needs >= 535.x for CUDA 12.x)
+nvidia-smi
+
+# Check PyTorch's CUDA runtime version
+python -c "import torch; print(torch.version.cuda)"
+
+# Check for conflicting CUDA libraries
+ldconfig -p | grep libcublas
+# If multiple libcublas.so paths appear pointing to different CUDA versions,
+# that is likely the root cause.
+```
+
+**Workaround**: If you cannot resolve the library conflict, install a PyTorch
+build with an older CUDA toolkit. The CUDA 12.8 driver is forward-compatible
+with cu126 binaries:
+
+```bash
+pip install 'torch==2.6.0' --index-url https://download.pytorch.org/whl/cu126
+```
+
+This sidesteps the conflict because the cu126 wheel carries fewer
+system-level library dependencies that can clash on CUDA 12.8 hosts. Note
+that the Docker container path (used by EKS) is unaffected because the
+container bundles its own CUDA toolkit with no host-level conflicts.
+
+### Sbatch script cannot find training code
+
+**Symptom**: `ModuleNotFoundError: No module named 'src'` or file-not-found
+errors for config files.
+
+**Root cause**: Slurm copies the batch script to `/var/spool/slurmd/`, so
+`realpath "$0"` resolves to the spool directory, not the original location.
+
+**Solution**: Use `SLURM_SUBMIT_DIR` to derive paths:
+
+```bash
+if [ -n "$SLURM_SUBMIT_DIR" ]; then
+    REPO_ROOT="$(cd "$SLURM_SUBMIT_DIR/.." && pwd)"
+fi
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+```
+
+### NCCL abort hides real Python errors
+
+**Symptom**: All ranks crash with `NCCL communicator was aborted` but no
+Python traceback is visible.
+
+**Root cause**: When one rank raises an exception after NCCL is initialized,
+the other ranks see an NCCL abort. The original exception is lost.
+
+**Solution**: Wrap the suspected code in `try/except` with
+`traceback.print_exc()`. Common hidden errors include missing packages
+(tensorboard) and deprecated API calls.
+
+### HyperPod auto-resume with Enroot containers
+
+**Symptom**: `srun: error: unrecognized option '--container-image'` when both
+`--auto-resume=1` and `--container-image` are used.
+
+**Solution**: Skip auto-resume in container mode. The HyperPod auto-resume
+wrapper does not pass through Pyxis plugin flags. See the sbatch scripts for
+the conditional logic.
 
 ---
 
@@ -515,10 +577,10 @@ If you're still stuck:
 1. Check the logs:
    ```bash
    # EKS pod logs
-   kubectl logs job/qwen3-qlora-training -n ml-training
+   kubectl logs qwen3-qlora-training-zero2-master-0 -n ml-training
 
    # Previous pod attempt logs (if restarted)
-   kubectl logs job/qwen3-qlora-training -n ml-training --previous
+   kubectl logs qwen3-qlora-training-zero2-master-0 -n ml-training --previous
    ```
 
 2. Create an issue on GitHub with:

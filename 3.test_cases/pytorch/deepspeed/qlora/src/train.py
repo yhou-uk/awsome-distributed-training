@@ -14,10 +14,10 @@ Supports distributed training via:
 - DeepSpeed ZeRO-3: full parameter sharding for maximum memory savings
 
 Usage (single GPU):
-    python src/train.py --config_path configs/training_config.yaml
+    python src/train.py --config_path configs/training_config_zero2.yaml
 
 Usage (multi-GPU with torchrun):
-    torchrun --nproc_per_node=4 src/train.py --config_path configs/training_config.yaml
+    torchrun --nproc_per_node=4 src/train.py --config_path configs/training_config_zero2.yaml
 """
 
 import os
@@ -31,9 +31,6 @@ from typing import Optional
 import torch
 from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from src.config import FullConfig
 from src.model_setup import setup_model_and_tokenizer, get_gpu_memory_info, log_gpu_memory
 from src.data_preparation import (
@@ -43,15 +40,6 @@ from src.data_preparation import (
     inspect_sample
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('training.log')
-    ]
-)
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--config_path",
         type=str,
-        default="configs/training_config.yaml",
+        default="configs/training_config_zero2.yaml",
         help="Path to configuration YAML file"
     )
     parser.add_argument(
@@ -175,6 +163,10 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
         return None
 
     # Sort by step number (checkpoint-100, checkpoint-200, etc.)
+    # Filter out non-numeric checkpoint names (e.g., checkpoint-emergency)
+    checkpoints = [c for c in checkpoints if c.split("-")[-1].isdigit()]
+    if not checkpoints:
+        return None
     checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
     latest = checkpoints[-1]
     logger.info(f"Found {len(checkpoints)} checkpoint(s), latest: {latest}")
@@ -287,6 +279,8 @@ def create_training_arguments(config: FullConfig) -> TrainingArguments:
     Returns:
         TrainingArguments instance
     """
+    strategy = config.parallel.strategy
+
     kwargs = dict(
         output_dir=config.training.output_dir,
         per_device_train_batch_size=config.training.per_device_train_batch_size,
@@ -300,7 +294,13 @@ def create_training_arguments(config: FullConfig) -> TrainingArguments:
         optim=config.training.optim,
         max_grad_norm=config.training.max_grad_norm,
         gradient_checkpointing=config.parallel.gradient_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # ZeRO-3 shards parameters across ranks, so during gradient checkpoint
+        # recomputation non-owning ranks see shape-[0] tensors.  The strict
+        # metadata check in non-reentrant checkpointing rejects this.
+        # use_reentrant=True skips that check and is compatible with ZeRO-3.
+        gradient_checkpointing_kwargs={
+            "use_reentrant": strategy == "deepspeed_zero3"
+        },
         bf16=config.training.bf16,
         fp16=config.training.fp16,
         logging_steps=config.training.logging_steps,
@@ -321,7 +321,6 @@ def create_training_arguments(config: FullConfig) -> TrainingArguments:
     )
 
     # Configure DeepSpeed if requested
-    strategy = config.parallel.strategy
     if strategy.startswith("deepspeed"):
         ds_config_path = config.parallel.deepspeed_config_path
         if ds_config_path is None:
@@ -353,6 +352,19 @@ def main():
     """Main training function."""
     args = parse_args()
 
+    # Configure logging: all ranks log to stdout, only rank 0 logs to file.
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if local_rank in (-1, 0):
+        output_dir = args.output_dir or "."
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(os.path.join(output_dir, "training.log")))
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+    )
+
     logger.info("=" * 60)
     logger.info("QLoRA Fine-tuning: Qwen3-8B on Medical Reasoning")
     logger.info("=" * 60)
@@ -372,7 +384,7 @@ def main():
     # Override settings from command line
     if args.output_dir:
         config.training.output_dir = args.output_dir
-    if args.max_samples:
+    if args.max_samples is not None:
         config.data.max_samples = args.max_samples
 
     # Create output directory
@@ -386,6 +398,7 @@ def main():
 
     # Log parallelism strategy
     num_gpus = torch.cuda.device_count()
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     strategy = config.parallel.strategy
     logger.info(f"Parallelism strategy: {strategy}")
     logger.info(f"Available GPUs: {num_gpus}")
@@ -405,6 +418,12 @@ def main():
             * config.training.gradient_accumulation_steps
         )
         logger.info(f"Effective batch size: {eff_batch}")
+
+    # Pin each process to its assigned GPU before loading the model.
+    # BitsAndBytes uses torch.cuda.current_device() internally for
+    # quantized weight allocation.
+    if torch.cuda.is_available() and local_rank >= 0:
+        torch.cuda.set_device(local_rank)
 
     # Setup model and tokenizer
     logger.info("\n" + "=" * 60)
@@ -461,24 +480,30 @@ def main():
     logger.info("Creating Trainer...")
     logger.info("=" * 60)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=3)
-        ]
-    )
+    try:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            callbacks=[
+                EarlyStoppingCallback(early_stopping_patience=3)
+            ]
+        )
+    except Exception as e:
+        logger.error(f"Failed to create Trainer: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
     # Log training info
     total_steps = (
         len(train_dataset) //
         (training_args.per_device_train_batch_size
          * training_args.gradient_accumulation_steps
-         * max(1, num_gpus))
+         * max(1, world_size))
         * training_args.num_train_epochs
     )
     logger.info(f"Total training steps (approx): {total_steps}")
@@ -537,8 +562,9 @@ def main():
     logger.info(f"Full model saved to: {final_path}")
 
     # Save just the LoRA adapter (much smaller)
+    # Use trainer.save_model to handle ZeRO-3 parameter gathering correctly
     lora_path = f"{config.training.output_dir}/lora_adapter"
-    model.save_pretrained(lora_path)
+    trainer.save_model(lora_path)
     logger.info(f"LoRA adapter saved to: {lora_path}")
 
     # Log final metrics

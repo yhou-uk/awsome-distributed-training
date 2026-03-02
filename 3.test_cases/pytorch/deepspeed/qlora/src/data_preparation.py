@@ -158,9 +158,22 @@ def tokenize_function(
         padding=False,  # We'll pad in the data collator
     )
 
-    # For causal LM, labels are the same as input_ids
-    # The model will shift them internally
-    tokenized["labels"] = tokenized["input_ids"].copy()
+    # For SFT, mask the prompt tokens in labels (set to -100) so the model
+    # only trains on generating the assistant response, not the prompt.
+    tokenized["labels"] = []
+    for i, (input_ids, text) in enumerate(zip(tokenized["input_ids"], examples["text"])):
+        labels = list(input_ids)
+        # Find where the assistant response starts
+        assistant_marker = "<|im_start|>assistant\n"
+        marker_pos = text.find(assistant_marker)
+        if marker_pos >= 0:
+            # Tokenize just the prompt portion to find its length
+            prompt_text = text[:marker_pos + len(assistant_marker)]
+            prompt_ids = tokenizer(prompt_text, truncation=False, add_special_tokens=False)["input_ids"]
+            # Mask prompt tokens with -100
+            for j in range(min(len(prompt_ids), len(labels))):
+                labels[j] = -100
+        tokenized["labels"].append(labels)
 
     return tokenized
 
@@ -240,6 +253,6 @@ def inspect_sample(dataset: Dataset, tokenizer: PreTrainedTokenizer, idx: int = 
     print(f"Sample {idx}")
     print(f"{'='*60}")
     print(f"Input length: {len(sample['input_ids'])} tokens")
-    print(f"\nDecoded text (first 500 chars):")
+    print(f"\nDecoded text (first 500 tokens):")
     print(tokenizer.decode(sample['input_ids'][:500]))
     print(f"\n{'='*60}\n")

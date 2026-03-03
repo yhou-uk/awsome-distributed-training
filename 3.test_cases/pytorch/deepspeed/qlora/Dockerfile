@@ -69,7 +69,6 @@ RUN mkdir -p /workspace/outputs /workspace/hf_cache
 # Set environment variables
 ENV PYTHONPATH=/app
 ENV HF_HOME=/workspace/hf_cache
-ENV TRANSFORMERS_CACHE=/workspace/hf_cache
 ENV PYTHONUNBUFFERED=1
 # Do NOT set CUDA_VISIBLE_DEVICES here — let torchrun / K8s manage GPU visibility
 # DeepSpeed / NCCL settings for multi-GPU communication

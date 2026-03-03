@@ -32,15 +32,12 @@ IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${
 echo "Creating ECR repository (if not exists)..."
 aws ecr describe-repositories --repository-names ${REPO_NAME} --region ${AWS_REGION} 2>/dev/null || \
     aws ecr create-repository \
-        --repository-name ${REPO_NAME} \
-        --region ${AWS_REGION} \
+echo "Creating ECR repository (if not exists)..."
+aws ecr describe-repositories --repository-names "${REPO_NAME}" --region "${AWS_REGION}" 2>/dev/null || \
+    aws ecr create-repository \
+        --repository-name "${REPO_NAME}" \
+        --region "${AWS_REGION}" \
         --image-scanning-configuration scanOnPush=true
-
-###########################
-###### Authenticate #######
-###########################
-
-echo "Authenticating to ECR..."
 aws ecr get-login-password --region ${AWS_REGION} | \
     docker login --username AWS --password-stdin \
     ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
